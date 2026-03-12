@@ -1,5 +1,5 @@
 """
-    LBFGS(m::Int = 8; 
+    LBFGS(m::Int = 8;
           acceptfirst::Bool = true,
           maxiter::Int=MAXITER[], # 1_000_000
           gradtol::Real=GRADTOL[], # 1e-8
@@ -51,156 +51,6 @@ function LBFGS(m::Int=8;
                                                                    maxfg=ls_maxfg,
                                                                    verbosity=ls_verbosity))
     return LBFGS(m, maxiter, gradtol, acceptfirst, verbosity, linesearch)
-end
-
-function optimize(fg, x, alg::LBFGS;
-                  precondition=_precondition,
-                  (finalize!)=_finalize!,
-                  shouldstop=DefaultShouldStop(alg.maxiter),
-                  hasconverged=DefaultHasConverged(alg.gradtol),
-                  retract=_retract, inner=_inner, (transport!)=_transport!,
-                  (scale!)=_scale!, (add!)=_add!,
-                  isometrictransport=(transport! == _transport! && inner == _inner))
-    t₀ = time()
-    verbosity = alg.verbosity
-    f, g = fg(x)
-    numfg = 1
-    numiter = 0
-    innergg = inner(x, g, g)
-    normgrad = sqrt(innergg)
-    fhistory = [f]
-    normgradhistory = [normgrad]
-    t = time() - t₀
-    _hasconverged = hasconverged(x, f, g, normgrad)
-    _shouldstop = shouldstop(x, f, g, numfg, numiter, t)
-
-    TangentType = typeof(g)
-    ScalarType = typeof(innergg)
-    m = alg.m
-    H = LBFGSInverseHessian(m, TangentType[], TangentType[], ScalarType[])
-
-    verbosity >= 2 &&
-        @info @sprintf("LBFGS: initializing with f = %.12e, ‖∇f‖ = %.4e", f, normgrad)
-
-    while !(_hasconverged || _shouldstop)
-        told = t
-        # compute new search direction
-        if length(H) > 0
-            Hg = let x = x
-                H(g, ξ -> precondition(x, ξ), (ξ1, ξ2) -> inner(x, ξ1, ξ2), add!, scale!)
-            end
-            η = scale!(Hg, -1)
-        else
-            Pg = precondition(x, deepcopy(g))
-            normPg = sqrt(inner(x, Pg, Pg))
-            η = scale!(Pg, -0.01 / normPg) # initial guess: scale invariant
-        end
-
-        # store current quantities as previous quantities
-        xprev = x
-        gprev = g
-        ηprev = η
-
-        # perform line search
-        _xlast[] = x # store result in global variables to debug linesearch failures
-        _glast[] = g
-        _dlast[] = η
-        x, f, g, ξ, α, nfg = alg.linesearch(fg, x, η, (f, g);
-                                            initialguess=one(f),
-                                            acceptfirst=alg.acceptfirst,
-                                            # for some reason, line search seems to converge to solution alpha = 2 in most cases if acceptfirst = false. If acceptfirst = true, the initial value of alpha can immediately be accepted. This typically leads to a more erratic convergence of normgrad, but to less function evaluations in the end.
-                                            retract=retract, inner=inner)
-        numfg += nfg
-        numiter += 1
-        x, f, g = finalize!(x, f, g, numiter)
-        innergg = inner(x, g, g)
-        normgrad = sqrt(innergg)
-        push!(fhistory, f)
-        push!(normgradhistory, normgrad)
-        t = time() - t₀
-        Δt = t - told
-        _hasconverged = hasconverged(x, f, g, normgrad)
-        _shouldstop = shouldstop(x, f, g, numfg, numiter, t)
-
-        # check stopping criteria and print info
-        if _hasconverged || _shouldstop
-            break
-        end
-        verbosity >= 3 &&
-            @info @sprintf("LBFGS: iter %4d, Δt %s: f = %.12e, ‖∇f‖ = %.4e, α = %.2e, m = %d, nfg = %d",
-                           numiter, format_time(Δt), f, normgrad, α, length(H), nfg)
-
-        # transport gprev, ηprev and vectors in Hessian approximation to x
-        gprev = transport!(gprev, xprev, ηprev, α, x)
-        for k in 1:length(H)
-            @inbounds s, y, ρ = H[k]
-            s = transport!(s, xprev, ηprev, α, x)
-            y = transport!(y, xprev, ηprev, α, x)
-            # QUESTION:
-            # Do we need to recompute ρ = inv(inner(x, s, y)) if transport is not isometric?
-            H[k] = (s, y, ρ)
-        end
-        ηprev = transport!(deepcopy(ηprev), xprev, ηprev, α, x)
-
-        if isometrictransport
-            # TRICK TO ENSURE LOCKING CONDITION IN THE CONTEXT OF LBFGS
-            #-----------------------------------------------------------
-            # (see A BROYDEN CLASS OF QUASI-NEWTON METHODS FOR RIEMANNIAN OPTIMIZATION)
-            # define new isometric transport such that, applying it to transported ηprev,
-            # it returns a vector proportional to ξ but with the norm of ηprev
-            # still has norm normη because transport is isometric
-            normη = sqrt(inner(x, ηprev, ηprev))
-            normξ = sqrt(inner(x, ξ, ξ))
-            β = normη / normξ
-            if !(inner(x, ξ, ηprev) ≈ normξ * normη) # ξ and η are not parallel
-                ξ₁ = ηprev
-                ξ₂ = scale!(ξ, β)
-                ν₁ = add!(ξ₁, ξ₂, +1)
-                ν₂ = scale!(deepcopy(ξ₂), -2)
-                squarednormν₁ = inner(x, ν₁, ν₁)
-                squarednormν₂ = inner(x, ν₂, ν₂)
-                # apply Householder transforms to gprev, ηprev and vectors in H
-                gprev = add!(gprev, ν₁, -2 * inner(x, ν₁, gprev) / squarednormν₁)
-                gprev = add!(gprev, ν₂, -2 * inner(x, ν₂, gprev) / squarednormν₂)
-                for k in 1:length(H)
-                    @inbounds s, y, ρ = H[k]
-                    s = add!(s, ν₁, -2 * inner(x, ν₁, s) / squarednormν₁)
-                    s = add!(s, ν₂, -2 * inner(x, ν₂, s) / squarednormν₂)
-                    y = add!(y, ν₁, -2 * inner(x, ν₁, y) / squarednormν₁)
-                    y = add!(y, ν₂, -2 * inner(x, ν₂, y) / squarednormν₂)
-                    H[k] = (s, y, ρ)
-                end
-                ηprev = ξ₂
-            end
-        else
-            # use cautious update below; see "A Riemannian BFGS Method without
-            # Differentiated Retraction for Nonconvex Optimization Problems"
-            β = one(normgrad)
-        end
-
-        # set up quantities for LBFGS update
-        y = add!(scale!(deepcopy(g), 1 / β), gprev, -1)
-        s = scale!(ηprev, α)
-        innersy = inner(x, s, y)
-        innerss = inner(x, s, s)
-
-        if innersy / innerss > normgrad / 10000
-            norms = sqrt(innerss)
-            ρ = innerss / innersy
-            push!(H, (scale!(s, 1 / norms), scale!(y, 1 / norms), ρ))
-        end
-    end
-    if _hasconverged
-        verbosity >= 2 &&
-            @info @sprintf("LBFGS: converged after %d iterations and time %s: f = %.12e, ‖∇f‖ = %.4e",
-                           numiter, format_time(t), f, normgrad)
-    else
-        verbosity >= 1 &&
-            @warn @sprintf("LBFGS: not converged to requested tol after %d iterations and time %s: f = %.12e, ‖∇f‖ = %.4e",
-                           numiter, format_time(t), f, normgrad)
-    end
-    history = [fhistory normgradhistory]
-    return x, f, g, numfg, history
 end
 
 mutable struct LBFGSInverseHessian{TangentType,ScalarType}
@@ -292,4 +142,268 @@ function (H::LBFGSInverseHessian)(g, precondition, inner, add!, scale!; α=H.α)
         z = add!(z, s, (α[k] - β))
     end
     return z
+end
+
+"""
+    LBFGSState
+
+Captures the complete state of an LBFGS optimization, enabling checkpointing and
+warm-starting. Instances are produced by the `checkpoint` callback passed to
+[`optimize`](@ref), and can be passed back as the starting point to resume optimization.
+
+## Fields
+- `x`: Current parameter values
+- `f`: Current function value
+- `g`: Current gradient
+- `H`: Current LBFGS inverse Hessian approximation (`LBFGSInverseHessian`)
+- `numfg`: Cumulative number of function/gradient evaluations so far
+- `numiter`: Cumulative number of completed iterations
+- `fhistory`: History of function values (one entry per iteration)
+- `normgradhistory`: History of gradient norms (one entry per iteration)
+
+## Example
+
+Periodic checkpointing using `Serialization` from the standard library:
+
+```julia
+using Serialization, OptimKit
+
+checkpoint_fn = state -> serialize("checkpoint.jls", state)
+x, f, g, numfg, history = optimize(fg, x0, LBFGS(); checkpoint=checkpoint_fn)
+
+# resume from the last checkpoint
+state = deserialize("checkpoint.jls")
+x, f, g, numfg, history = optimize(fg, state, LBFGS())
+```
+
+!!! note
+    The `LBFGSState` struct stores references to the arrays `x`, `g`, and the vectors
+    inside `H`. When using GPU arrays or other non-standard backends, ensure your
+    serialization method handles those array types correctly.
+
+!!! note
+    When resuming, the `shouldstop` and `hasconverged` callbacks receive the *cumulative*
+    `numfg` and `numiter` values from the original run. Pass a custom `shouldstop` if you
+    need a fixed number of *additional* iterations.
+"""
+struct LBFGSState{X,G,F<:Real,H<:LBFGSInverseHessian}
+    x::X
+    f::F
+    g::G
+    H::H
+    numfg::Int
+    numiter::Int
+    fhistory::Vector{F}
+    normgradhistory::Vector{F}
+end
+
+function optimize(fg, x, alg::LBFGS;
+                  precondition=_precondition,
+                  (finalize!)=_finalize!,
+                  checkpoint=nothing,
+                  shouldstop=DefaultShouldStop(alg.maxiter),
+                  hasconverged=DefaultHasConverged(alg.gradtol),
+                  retract=_retract, inner=_inner, (transport!)=_transport!,
+                  (scale!)=_scale!, (add!)=_add!,
+                  isometrictransport=(transport! == _transport! && inner == _inner))
+    t₀ = time()
+    verbosity = alg.verbosity
+    f, g = fg(x)
+    numfg = 1
+    numiter = 0
+    innergg = inner(x, g, g)
+    normgrad = sqrt(innergg)
+    fhistory = [f]
+    normgradhistory = [normgrad]
+
+    TangentType = typeof(g)
+    ScalarType = typeof(innergg)
+    m = alg.m
+    H = LBFGSInverseHessian(m, TangentType[], TangentType[], ScalarType[])
+
+    return _lbfgs_loop!(fg, x, f, g, H, numfg, numiter, normgrad, fhistory,
+                        normgradhistory, t₀, alg,
+                        precondition, finalize!, checkpoint,
+                        shouldstop, hasconverged,
+                        retract, inner, transport!, scale!, add!,
+                        isometrictransport)
+end
+
+"""
+    optimize(fg, state::LBFGSState, alg::LBFGS; kwargs...) -> x, f, g, numfg, history
+
+Resume an LBFGS optimization from a previously saved [`LBFGSState`](@ref). All keyword
+arguments are the same as for the standard `optimize` call. The `numfg`, `numiter`,
+`fhistory`, and `normgradhistory` are continued from the checkpoint; the returned
+`history` matrix covers the full run including prior iterations.
+"""
+function optimize(fg, state::LBFGSState, alg::LBFGS;
+                  precondition=_precondition,
+                  (finalize!)=_finalize!,
+                  checkpoint=nothing,
+                  shouldstop=DefaultShouldStop(alg.maxiter),
+                  hasconverged=DefaultHasConverged(alg.gradtol),
+                  retract=_retract, inner=_inner, (transport!)=_transport!,
+                  (scale!)=_scale!, (add!)=_add!,
+                  isometrictransport=(transport! == _transport! && inner == _inner))
+    t₀ = time()
+    x = state.x
+    f = state.f
+    g = state.g
+    H = deepcopy(state.H)
+    numfg = state.numfg
+    numiter = state.numiter
+    normgrad = state.normgradhistory[end]
+    fhistory = copy(state.fhistory)
+    normgradhistory = copy(state.normgradhistory)
+
+    return _lbfgs_loop!(fg, x, f, g, H, numfg, numiter, normgrad, fhistory,
+                        normgradhistory, t₀, alg,
+                        precondition, finalize!, checkpoint,
+                        shouldstop, hasconverged,
+                        retract, inner, transport!, scale!, add!,
+                        isometrictransport)
+end
+
+function _lbfgs_loop!(fg, x, f, g, H, numfg, numiter, normgrad, fhistory, normgradhistory,
+                      t₀, alg::LBFGS,
+                      precondition, finalize!, checkpoint,
+                      shouldstop, hasconverged,
+                      retract, inner, transport!, scale!, add!, isometrictransport)
+    verbosity = alg.verbosity
+    t = time() - t₀
+    _hasconverged = hasconverged(x, f, g, normgrad)
+    _shouldstop = shouldstop(x, f, g, numfg, numiter, t)
+
+    verbosity >= 2 &&
+        @info @sprintf("LBFGS: initializing with f = %.12e, ‖∇f‖ = %.4e", f, normgrad)
+
+    while !(_hasconverged || _shouldstop)
+        told = t
+        # compute new search direction
+        if length(H) > 0
+            Hg = let x = x
+                H(g, ξ -> precondition(x, ξ), (ξ1, ξ2) -> inner(x, ξ1, ξ2), add!, scale!)
+            end
+            η = scale!(Hg, -1)
+        else
+            Pg = precondition(x, deepcopy(g))
+            normPg = sqrt(inner(x, Pg, Pg))
+            η = scale!(Pg, -0.01 / normPg) # initial guess: scale invariant
+        end
+
+        # store current quantities as previous quantities
+        xprev = x
+        gprev = g
+        ηprev = η
+
+        # perform line search
+        _xlast[] = x # store result in global variables to debug linesearch failures
+        _glast[] = g
+        _dlast[] = η
+        x, f, g, ξ, α, nfg = alg.linesearch(fg, x, η, (f, g);
+                                            initialguess=one(f),
+                                            acceptfirst=alg.acceptfirst,
+                                            # for some reason, line search seems to converge to solution alpha = 2 in most cases if acceptfirst = false. If acceptfirst = true, the initial value of alpha can immediately be accepted. This typically leads to a more erratic convergence of normgrad, but to less function evaluations in the end.
+                                            retract=retract, inner=inner)
+        numfg += nfg
+        numiter += 1
+        x, f, g = finalize!(x, f, g, numiter)
+        innergg = inner(x, g, g)
+        normgrad = sqrt(innergg)
+        push!(fhistory, f)
+        push!(normgradhistory, normgrad)
+        t = time() - t₀
+        Δt = t - told
+        _hasconverged = hasconverged(x, f, g, normgrad)
+        _shouldstop = shouldstop(x, f, g, numfg, numiter, t)
+
+        # print iteration info if continuing (preserves original verbosity behavior)
+        if !(_hasconverged || _shouldstop)
+            verbosity >= 3 &&
+                @info @sprintf("LBFGS: iter %4d, Δt %s: f = %.12e, ‖∇f‖ = %.4e, α = %.2e, m = %d, nfg = %d",
+                               numiter, format_time(Δt), f, normgrad, α, length(H), nfg)
+        end
+
+        # transport gprev, ηprev and vectors in Hessian approximation to x
+        gprev = transport!(gprev, xprev, ηprev, α, x)
+        for k in 1:length(H)
+            @inbounds s, y, ρ = H[k]
+            s = transport!(s, xprev, ηprev, α, x)
+            y = transport!(y, xprev, ηprev, α, x)
+            # QUESTION:
+            # Do we need to recompute ρ = inv(inner(x, s, y)) if transport is not isometric?
+            H[k] = (s, y, ρ)
+        end
+        ηprev = transport!(deepcopy(ηprev), xprev, ηprev, α, x)
+
+        if isometrictransport
+            # TRICK TO ENSURE LOCKING CONDITION IN THE CONTEXT OF LBFGS
+            #-----------------------------------------------------------
+            # (see A BROYDEN CLASS OF QUASI-NEWTON METHODS FOR RIEMANNIAN OPTIMIZATION)
+            # define new isometric transport such that, applying it to transported ηprev,
+            # it returns a vector proportional to ξ but with the norm of ηprev
+            # still has norm normη because transport is isometric
+            normη = sqrt(inner(x, ηprev, ηprev))
+            normξ = sqrt(inner(x, ξ, ξ))
+            β = normη / normξ
+            if !(inner(x, ξ, ηprev) ≈ normξ * normη) # ξ and η are not parallel
+                ξ₁ = ηprev
+                ξ₂ = scale!(ξ, β)
+                ν₁ = add!(ξ₁, ξ₂, +1)
+                ν₂ = scale!(deepcopy(ξ₂), -2)
+                squarednormν₁ = inner(x, ν₁, ν₁)
+                squarednormν₂ = inner(x, ν₂, ν₂)
+                # apply Householder transforms to gprev, ηprev and vectors in H
+                gprev = add!(gprev, ν₁, -2 * inner(x, ν₁, gprev) / squarednormν₁)
+                gprev = add!(gprev, ν₂, -2 * inner(x, ν₂, gprev) / squarednormν₂)
+                for k in 1:length(H)
+                    @inbounds s, y, ρ = H[k]
+                    s = add!(s, ν₁, -2 * inner(x, ν₁, s) / squarednormν₁)
+                    s = add!(s, ν₂, -2 * inner(x, ν₂, s) / squarednormν₂)
+                    y = add!(y, ν₁, -2 * inner(x, ν₁, y) / squarednormν₁)
+                    y = add!(y, ν₂, -2 * inner(x, ν₂, y) / squarednormν₂)
+                    H[k] = (s, y, ρ)
+                end
+                ηprev = ξ₂
+            end
+        else
+            # use cautious update below; see "A Riemannian BFGS Method without
+            # Differentiated Retraction for Nonconvex Optimization Problems"
+            β = one(normgrad)
+        end
+
+        # set up quantities for LBFGS update
+        y = add!(scale!(deepcopy(g), 1 / β), gprev, -1)
+        s = scale!(ηprev, α)
+        innersy = inner(x, s, y)
+        innerss = inner(x, s, s)
+
+        if innersy / innerss > normgrad / 10000
+            norms = sqrt(innerss)
+            ρ = innerss / innersy
+            push!(H, (scale!(s, 1 / norms), scale!(y, 1 / norms), ρ))
+        end
+
+        # checkpoint after H is updated; called every iteration including the last
+        if !isnothing(checkpoint)
+            checkpoint(LBFGSState(x, f, g, H, numfg, numiter, fhistory, normgradhistory))
+        end
+
+        # break after checkpoint so the final state is always captured
+        if _hasconverged || _shouldstop
+            break
+        end
+    end
+    if _hasconverged
+        verbosity >= 2 &&
+            @info @sprintf("LBFGS: converged after %d iterations and time %s: f = %.12e, ‖∇f‖ = %.4e",
+                           numiter, format_time(t), f, normgrad)
+    else
+        verbosity >= 1 &&
+            @warn @sprintf("LBFGS: not converged to requested tol after %d iterations and time %s: f = %.12e, ‖∇f‖ = %.4e",
+                           numiter, format_time(t), f, normgrad)
+    end
+    history = [fhistory normgradhistory]
+    return x, f, g, numfg, history
 end
