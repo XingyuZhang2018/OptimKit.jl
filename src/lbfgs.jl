@@ -53,97 +53,6 @@ function LBFGS(m::Int=8;
     return LBFGS(m, maxiter, gradtol, acceptfirst, verbosity, linesearch)
 end
 
-mutable struct LBFGSInverseHessian{TangentType,ScalarType}
-    maxlength::Int
-    length::Int
-    first::Int
-    S::Vector{TangentType}
-    Y::Vector{TangentType}
-    ρ::Vector{ScalarType}
-    α::Vector{ScalarType} # work space
-    function LBFGSInverseHessian{T1,T2}(maxlength::Int, S::Vector{T1}, Y::Vector{T1},
-                                        ρ::Vector{T2}) where {T1,T2}
-        @assert length(S) == length(Y) == length(ρ)
-        l = length(S)
-        S = resize!(copy(S), maxlength)
-        Y = resize!(copy(Y), maxlength)
-        ρ = resize!(copy(ρ), maxlength)
-        α = similar(ρ)
-        return new{T1,T2}(maxlength, l, 1, S, Y, ρ, α)
-    end
-end
-function LBFGSInverseHessian(maxlength::Int, S::Vector{T1}, Y::Vector{T1},
-                             ρ::Vector{T2}) where {T1,T2}
-    return LBFGSInverseHessian{T1,T2}(maxlength, S, Y, ρ)
-end
-
-Base.length(H::LBFGSInverseHessian) = H.length
-
-@inline function Base.getindex(H::LBFGSInverseHessian, i::Int)
-    @boundscheck if i < 1 || i > H.length
-        throw(BoundsError(H, i))
-    end
-    n = H.maxlength
-    idx = H.first + i - 1
-    idx = ifelse(idx > n, idx - n, idx)
-    return (getindex(H.S, idx), getindex(H.Y, idx), getindex(H.ρ, idx))
-end
-
-@inline function Base.setindex!(H::LBFGSInverseHessian, (s, y, ρ), i)
-    @boundscheck if i < 1 || i > H.length
-        throw(BoundsError(H, i))
-    end
-    n = H.maxlength
-    idx = H.first + i - 1
-    idx = ifelse(idx > n, idx - n, idx)
-    return (setindex!(H.S, s, idx), setindex!(H.Y, y, idx), setindex!(H.ρ, ρ, idx))
-end
-
-@inline function Base.push!(H::LBFGSInverseHessian, (s, y, ρ))
-    if H.length < H.maxlength
-        H.length += 1
-    else
-        H.first = (H.first == H.maxlength ? 1 : H.first + 1)
-    end
-    @inbounds setindex!(H, (s, y, ρ), H.length)
-    return H
-end
-@inline function Base.pop!(H::LBFGSInverseHessian)
-    @inbounds v = H[H.length]
-    H.length -= 1
-    return v
-end
-@inline function Base.popfirst!(H::LBFGSInverseHessian)
-    @inbounds v = H[1]
-    H.first = (H.first == H.maxlength ? 1 : H.first + 1)
-    H.length -= 1
-    return v
-end
-
-@inline function Base.empty!(H::LBFGSInverseHessian)
-    H.length = 0
-    H.first = 1
-    return H
-end
-
-function (H::LBFGSInverseHessian)(g, precondition, inner, add!, scale!; α=H.α)
-    q = deepcopy(g)
-    for k in length(H):-1:1
-        s, y, ρ = H[k]
-        α[k] = ρ * inner(s, q)
-        q = add!(q, y, -α[k])
-    end
-    s, y, ρ = H[length(H)]
-    γ = inner(s, y) / inner(y, precondition(y))
-    z = scale!(precondition(q), γ)
-    for k in 1:length(H)
-        s, y, ρ = H[k]
-        β = ρ * inner(y, z)
-        z = add!(z, s, (α[k] - β))
-    end
-    return z
-end
-
 """
     LBFGSState
 
@@ -186,7 +95,7 @@ x, f, g, numfg, history = optimize(fg, state, LBFGS())
     `numfg` and `numiter` values from the original run. Pass a custom `shouldstop` if you
     need a fixed number of *additional* iterations.
 """
-struct LBFGSState{X,G,F<:Real,H<:LBFGSInverseHessian}
+struct LBFGSState{X,G,F<:Real,H}
     x::X
     f::F
     g::G
@@ -406,4 +315,95 @@ function _lbfgs_loop!(fg, x, f, g, H, numfg, numiter, normgrad, fhistory, normgr
     end
     history = [fhistory normgradhistory]
     return x, f, g, numfg, history
+end
+
+mutable struct LBFGSInverseHessian{TangentType,ScalarType}
+    maxlength::Int
+    length::Int
+    first::Int
+    S::Vector{TangentType}
+    Y::Vector{TangentType}
+    ρ::Vector{ScalarType}
+    α::Vector{ScalarType} # work space
+    function LBFGSInverseHessian{T1,T2}(maxlength::Int, S::Vector{T1}, Y::Vector{T1},
+                                        ρ::Vector{T2}) where {T1,T2}
+        @assert length(S) == length(Y) == length(ρ)
+        l = length(S)
+        S = resize!(copy(S), maxlength)
+        Y = resize!(copy(Y), maxlength)
+        ρ = resize!(copy(ρ), maxlength)
+        α = similar(ρ)
+        return new{T1,T2}(maxlength, l, 1, S, Y, ρ, α)
+    end
+end
+function LBFGSInverseHessian(maxlength::Int, S::Vector{T1}, Y::Vector{T1},
+                             ρ::Vector{T2}) where {T1,T2}
+    return LBFGSInverseHessian{T1,T2}(maxlength, S, Y, ρ)
+end
+
+Base.length(H::LBFGSInverseHessian) = H.length
+
+@inline function Base.getindex(H::LBFGSInverseHessian, i::Int)
+    @boundscheck if i < 1 || i > H.length
+        throw(BoundsError(H, i))
+    end
+    n = H.maxlength
+    idx = H.first + i - 1
+    idx = ifelse(idx > n, idx - n, idx)
+    return (getindex(H.S, idx), getindex(H.Y, idx), getindex(H.ρ, idx))
+end
+
+@inline function Base.setindex!(H::LBFGSInverseHessian, (s, y, ρ), i)
+    @boundscheck if i < 1 || i > H.length
+        throw(BoundsError(H, i))
+    end
+    n = H.maxlength
+    idx = H.first + i - 1
+    idx = ifelse(idx > n, idx - n, idx)
+    return (setindex!(H.S, s, idx), setindex!(H.Y, y, idx), setindex!(H.ρ, ρ, idx))
+end
+
+@inline function Base.push!(H::LBFGSInverseHessian, (s, y, ρ))
+    if H.length < H.maxlength
+        H.length += 1
+    else
+        H.first = (H.first == H.maxlength ? 1 : H.first + 1)
+    end
+    @inbounds setindex!(H, (s, y, ρ), H.length)
+    return H
+end
+@inline function Base.pop!(H::LBFGSInverseHessian)
+    @inbounds v = H[H.length]
+    H.length -= 1
+    return v
+end
+@inline function Base.popfirst!(H::LBFGSInverseHessian)
+    @inbounds v = H[1]
+    H.first = (H.first == H.maxlength ? 1 : H.first + 1)
+    H.length -= 1
+    return v
+end
+
+@inline function Base.empty!(H::LBFGSInverseHessian)
+    H.length = 0
+    H.first = 1
+    return H
+end
+
+function (H::LBFGSInverseHessian)(g, precondition, inner, add!, scale!; α=H.α)
+    q = deepcopy(g)
+    for k in length(H):-1:1
+        s, y, ρ = H[k]
+        α[k] = ρ * inner(s, q)
+        q = add!(q, y, -α[k])
+    end
+    s, y, ρ = H[length(H)]
+    γ = inner(s, y) / inner(y, precondition(y))
+    z = scale!(precondition(q), γ)
+    for k in 1:length(H)
+        s, y, ρ = H[k]
+        β = ρ * inner(y, z)
+        z = add!(z, s, (α[k] - β))
+    end
+    return z
 end
